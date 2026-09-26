@@ -68,7 +68,8 @@ const normalize = (data) => {
     title: String(data.title || '').trim(),
     artists,
     album: String(data.album || '').trim(),
-    cover: data.cover_path || data.cover_url || data.cover || '',
+    cover: [data.cover_path, data.cover_url, data.cover]
+      .find(v => v && v !== 'n/a') || '',
     status: String(data.status || 'unknown').toLowerCase(),
     progress: Number(data.progress),
     duration: Number(data.duration),
