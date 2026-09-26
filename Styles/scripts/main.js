@@ -40,11 +40,8 @@ const stayOnStop = urlParams.get('stay') === '1';
 const hideOnPause = urlParams.get('hidepaused') === '1';
 const isPreview = urlParams.get('preview') === '1' || urlParams.get('demo') === '1';
 
-// The builder preview uses the original visual scale so it remains compact
-// inside the builder while the standalone overlay uses the native 2x scale.
-if (isPreview) {
-  document.documentElement.style.setProperty('--np-scale', '1');
-}
+// Keep the builder preview at the original visual scale; standalone overlays use 2x.
+if (isPreview) document.documentElement.style.setProperty('--np-scale', '1');
 
 if (theme) {
   const link = document.createElement('link');
@@ -108,91 +105,230 @@ const applyScrolling = (el, container) => {
   el.style.removeProperty('--scroll-distance');
   el.style.removeProperty('--scroll-offset');
   el.style.animationDuration = '';
-  // Wait a frame so scrollWidth is measured after layout.
+  // Wait a frame so scrollWidth is measured after textContent update.
   requestAnimationFrame(() => {
-    if (!el || !container) return;
     const overflow = el.scrollWidth - container.clientWidth;
-    if (overflow > 1) {
-      const offset = Math.max(12, container.clientWidth * 0.08);
-      const distance = overflow + offset;
-      const duration = Math.max(4, distance / 35);
-      el.style.setProperty('--scroll-distance', `${distance}px`);
-      el.style.setProperty('--scroll-offset', `${offset}px`);
-      el.style.animationDuration = `${duration}s`;
+    if (overflow > 8) {
+      el.style.setProperty('--scroll-distance', `${overflow}px`);
+      el.style.setProperty('--scroll-offset', `${container.clientWidth + 12}px`);
+      el.style.animationDuration = `${Math.min(Math.max(el.textContent.length / 4, 4), 15)}s`;
       el.classList.add('scrolling-text');
     }
   });
 };
 
-const setVisible = (visible) => {
-  const el = document.querySelector('.now-playing');
-  if (!el) return;
-  el.classList.toggle('is-visible', visible);
-};
-
-const render = (data) => {
-  if (!data) return;
-  currentData = data;
-
-  titleEl.textContent = data.title;
-  artistsEl.textContent = data.artists.join(', ');
-  albumEl.textContent = data.album;
-  albumEl.style.display = showAlbum && data.album ? '' : 'none';
-
-  if (showCover && data.cover) {
-    coverImage.src = data.cover;
-    coverImage.style.display = '';
-    coverBackground.style.backgroundImage = `url("${data.cover}")`;
-  } else {
-    coverImage.style.display = 'none';
-    coverBackground.style.backgroundImage = '';
-  }
-
-  progressWrap.style.display = showProgress ? '' : 'none';
-
-  const visible = !shouldHide(data);
-  setVisible(visible);
-
-  applyScrolling(titleEl, titleEl.parentElement);
-  applyScrolling(artistsEl, artistsEl.parentElement);
-  applyScrolling(albumEl, albumEl.parentElement);
-};
-
-const renderPlaceholder = () => {
-  render({
-    title: 'Demo Track',
-    artists: ['Tuna Presets'],
-    album: 'Preview',
-    cover: PLACEHOLDER_COVER,
-    status: 'playing',
-    progress: 42,
-    duration: 240,
-    timeLeft: 138,
+const resetScrolling = () => {
+  [titleEl, artistsEl].forEach(el => {
+    if (!el) return;
+    el.classList.remove('scrolling-text');
+    el.style.animationDuration = '';
+    el.style.removeProperty('--scroll-distance');
+    el.style.removeProperty('--scroll-offset');
   });
 };
 
-const poll = async () => {
-  if (isPreview) return;
-  try {
-    const response = await fetch('http://localhost:1608/', { cache: 'no-store' });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const data = normalize(await response.json());
-    if (isValid(data)) {
-      misses = 0;
-      render(data);
-    } else {
-      misses++;
-      if (misses >= MAX_MISSES_BEFORE_HIDE) setVisible(false);
-    }
-  } catch (error) {
-    misses++;
-    if (misses >= MAX_MISSES_BEFORE_HIDE) setVisible(false);
+const setCover = (src) => {
+  if (!coverImage) return;
+  const next = src && src !== 'n/a' ? src : PLACEHOLDER_COVER;
+  // Cache-bust file:// covers (VLC rewrites the same path); remote URLs keep as-is.
+  const bust = next.startsWith('data:') || next.includes('?') ? next : `${next}${next.includes('?') ? '&' : '?'}t=${Date.now()}`;
+  if (coverImage.dataset.cur === next) return;
+  coverImage.dataset.cur = next;
+  coverImage.src = bust;
+  if (coverBackground && theme !== 'simple') {
+    coverBackground.style.backgroundImage = `url("${bust}")`;
   }
 };
 
+if (coverImage) {
+  coverImage.addEventListener('error', () => {
+    coverImage.dataset.cur = PLACEHOLDER_COVER;
+    coverImage.src = PLACEHOLDER_COVER;
+  });
+}
+
+const setPausedVisual = (paused) => {
+  if (nowPlaying) nowPlaying.classList.toggle('is-paused', !!paused);
+};
+
+// ---------- progress prediction ----------
+// Tuna only reports position ~once/sec, so between polls we predict forward
+// from the last report. Reports never move the bar directly — they only steer
+// its *speed* (phase-locked loop), so it glides without ever jumping.
+// Small disagreements (<0.6s, e.g. Tuna rounding to whole seconds) are ignored;
+// big ones (>4s, e.g. a seek) snap. The estimate freezes while paused.
+let progressEst = null; // { pos, duration, at, paused, rate } — seconds + timestamp
+
+const normalizeTime = (progress, duration) => {
+  let p = progress, d = duration;
+  // Some sources report milliseconds — detect and convert to seconds.
+  if (d > 36000 || (d > 0 && p > d * 2 && p > 600)) { p /= 1000; d /= 1000; }
+  return { p, d };
+};
+
+const predictPos = (est, now) => {
+  if (!est) return 0;
+  if (est.paused) return est.pos;
+  return Math.min(est.pos + ((now - est.at) / 1000) * est.rate, est.duration);
+};
+
+// Smooth progress bar driven by rAF between polls.
+const tickProgress = () => {
+  cancelAnimationFrame(progressRaf);
+  if (!showProgress || !progressWrap || !progressFill || !progressEst) {
+    if (progressWrap) progressWrap.style.display = 'none';
+    return;
+  }
+  progressWrap.style.display = '';
+  const step = () => {
+    if (!progressEst) return;
+    const ratio = predictPos(progressEst, Date.now()) / progressEst.duration;
+    progressFill.style.transform = `scaleX(${Math.min(Math.max(ratio, 0), 1)})`;
+    if (ratio < 1) progressRaf = requestAnimationFrame(step);
+  };
+  step();
+};
+
+// Feed a fresh Tuna report into the estimate.
+const feedProgress = (d, reset) => {
+  if (!showProgress || !Number.isFinite(d.progress) || !Number.isFinite(d.duration) || d.duration <= 0) {
+    progressEst = null;
+    tickProgress();
+    return;
+  }
+  const { p, d: dur } = normalizeTime(d.progress, d.duration);
+  const now = Date.now();
+  const paused = d.status === 'paused';
+  const pos = Math.min(Math.max(p, 0), dur);
+  if (!reset && progressEst && progressEst.duration === dur) {
+    // Same song: steer the speed toward the report; never move the bar instantly.
+    const predicted = predictPos(progressEst, now);
+    const err = pos - predicted;
+    if (Math.abs(err) > 4) {
+      progressEst = { pos, duration: dur, at: now, paused, rate: 1 }; // seek: snap
+    } else {
+      const over = Math.max(Math.abs(err) - 0.6, 0); // deadband absorbs rounding
+      const adj = Math.max(Math.min(over * Math.sign(err) * 0.35, 0.25), -0.2);
+      progressEst = { pos: predicted, duration: dur, at: now, paused, rate: paused ? 1 : 1 + adj };
+    }
+  } else {
+    progressEst = { pos, duration: dur, at: now, paused, rate: 1 };
+  }
+  tickProgress();
+};
+
+// ---------- render ----------
+
+const render = (d) => {
+  titleEl.textContent = d.title;
+  artistsEl.textContent = d.artists.join(', ');
+  titleEl.title = d.title;
+  artistsEl.title = d.artists.join(', ');
+
+  if (albumEl) {
+    if (showAlbum && d.album) {
+      albumEl.textContent = d.album;
+      albumEl.style.display = '';
+    } else {
+      albumEl.style.display = 'none';
+    }
+  }
+
+  if (showCover) setCover(d.cover);
+  else if (coverImage) coverImage.style.display = 'none';
+
+  feedProgress(d, true); // new song: snap to the reported position
+
+  setPausedVisual(d.status === 'paused');
+  nowPlaying.classList.remove('hidden');
+  if (coverImage && showCover) coverImage.classList.remove('hidden');
+
+  const details = document.querySelector('.details');
+  applyScrolling(titleEl, details);
+  applyScrolling(artistsEl, details);
+};
+
+const hideOverlay = async () => {
+  cancelAnimationFrame(progressRaf);
+  progressEst = null;
+  if (currentData !== null) {
+    await animate(nowPlaying, 0, animation);
+    currentData = null;
+  } else {
+    // Already hidden — make sure it stays hidden instantly.
+    await animate(nowPlaying, 0, animation, true);
+  }
+  nowPlaying.classList.add('hidden');
+};
+
+const update = async (raw) => {
+  const data = normalize(raw);
+
+  if (shouldHide(data)) {
+    await hideOverlay();
+    return;
+  }
+
+  if (!isValid(data)) {
+    // Invalid/unknown payload: keep showing the last good song instead of
+    // flashing empty. Only hide if we never had anything valid.
+    if (!currentData && !stayOnStop) await hideOverlay();
+    return;
+  }
+
+  if (isSameSong(data, currentData)) {
+    // Same song re-polled: blend the report into the prediction + update paused state.
+    feedProgress(data, false);
+    setPausedVisual(data.status === 'paused');
+    return;
+  }
+
+  await animate(nowPlaying, 0, animation);
+  currentData = data;
+  resetScrolling();
+  render(data);
+  await animate(nowPlaying, 1, animation);
+};
+
+// ---------- polling ----------
+
+const poll = async () => {
+  try {
+    const res = await fetch('http://localhost:1608', { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    misses = 0;
+    await update(data);
+  } catch (err) {
+    misses += 1;
+    // Tolerate a few blips (Tuna restarting, source switching) before hiding.
+    if (misses >= MAX_MISSES_BEFORE_HIDE) {
+      console.warn('Tuna unreachable, hiding overlay.', err);
+      await update({ status: 'stopped' });
+    }
+  } finally {
+    setTimeout(poll, POLL_INTERVAL_MS);
+  }
+};
+
+// ---------- boot ----------
+
 if (isPreview) {
-  renderPlaceholder();
+  const demo = normalize({
+    title: 'Midnight City Lights (超 Long Title To Demo Scrolling Text Behaviour)',
+    artists: ['Demo Artist', 'Feat. Someone'],
+    album: 'Demo Album',
+    cover_path: '',
+    status: 'playing',
+    progress: 42,
+    duration: 213,
+  });
+  currentData = null;
+  resetScrolling();
+  // Use placeholder art in preview so OBS styling works without Tuna running.
+  render({ ...demo, cover: '' });
+  setCover('');
+  animate(nowPlaying, 1, animation, true);
 } else {
-  poll();
-  setInterval(poll, POLL_INTERVAL_MS);
+  animate(nowPlaying, 0, animation, true).then(poll);
 }
