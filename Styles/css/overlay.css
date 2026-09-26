@@ -7,6 +7,9 @@
   --np-accent: #7c3aed;
   --np-align: left;
   --np-radius: 10px;
+  /* Native preset size multiplier. CSS zoom scales the layout without
+     consuming the transform property used by overlay animations. */
+  --np-scale: 2;
 }
 
 * { box-sizing: border-box; }
@@ -61,6 +64,8 @@ body[data-position="center"]       { justify-content: center;     align-items: c
   position: relative;
   isolation: isolate;
   display: flex;
+  zoom: var(--np-scale);
+
   align-items: center;
   gap: 10px;
   margin: 12px;
