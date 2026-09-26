@@ -40,6 +40,9 @@ const stayOnStop = urlParams.get('stay') === '1';
 const hideOnPause = urlParams.get('hidepaused') === '1';
 const isPreview = urlParams.get('preview') === '1' || urlParams.get('demo') === '1';
 
+// Keep the builder preview at the original visual scale; standalone overlays use 2x.
+if (isPreview) document.documentElement.style.setProperty('--np-scale', '1');
+
 if (theme) {
   const link = document.createElement('link');
   link.rel = 'stylesheet';
